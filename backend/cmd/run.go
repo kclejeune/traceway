@@ -182,6 +182,16 @@ func Run(opts ...Option) {
 		router = gin.Default()
 	}
 
+	// Gin trusts X-Forwarded-For from any peer by default, which would let a
+	// direct client pick its own ClientIP() and rotate out of the per-IP limits.
+	if err := router.SetTrustedProxies(cfg.TrustedProxyList()); err != nil {
+		panic(fmt.Errorf("invalid TRUSTED_PROXIES: %w", err))
+	}
+	// Taken verbatim as the client IP when present, bypassing the proxy list —
+	// only safe when every path to the backend runs through a proxy that
+	// overwrites the header (e.g. ingress-nginx X-Real-IP, CF-Connecting-IP).
+	router.TrustedPlatform = cfg.TrustedProxyHeader
+
 	if monitoringTracewayUrl := cfg.MonitoringTracewayURL; monitoringTracewayUrl != "" {
 		twmw := tracewaygin.New(
 			monitoringTracewayUrl,
@@ -316,6 +326,8 @@ func applyEnvOverrides(cfg *config.Cfg) {
 		{"SYNTHETICS_SCREENSHOT_RETENTION_DAYS", &cfg.SyntheticsScreenshotRetentionDays},
 		{"SYNTHETICS_RUNNER_SECRET", &cfg.SyntheticsRunnerSecret},
 		{"HEALTH_DEEP_TOKEN", &cfg.HealthDeepToken},
+		{"TRUSTED_PROXIES", &cfg.TrustedProxies},
+		{"TRUSTED_PROXY_HEADER", &cfg.TrustedProxyHeader},
 		{"TWILIO_ACCOUNT_SID", &cfg.TwilioAccountSID},
 		{"TWILIO_AUTH_TOKEN", &cfg.TwilioAuthToken},
 		{"TWILIO_FROM_NUMBER", &cfg.TwilioFromNumber},

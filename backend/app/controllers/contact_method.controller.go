@@ -53,7 +53,7 @@ const (
 // methods: the route rate limits alone would still let one account (or many)
 // repoint methods in a loop and flood a number with codes.
 var (
-	verificationSendLimiter    = middleware.NewFixedWindowLimiter(3, time.Hour)
+	verificationSendLimiter    = middleware.NewSharedFixedWindowLimiter(middleware.VerificationSendRateLimitScope, 3, time.Hour)
 	errVerificationSendLimited = errors.New("verification send limit reached for this number")
 )
 
@@ -88,7 +88,11 @@ func smsUnavailable(methodType string) bool {
 // request path). Returns errVerificationSendLimited when the number's send
 // budget is exhausted.
 func beginVerification(ctx *gin.Context, tx *sql.Tx, method *models.UserContactMethod) error {
-	if !verificationSendLimiter.Allow(oncall.SMSPhoneNumber(method.Config)) {
+	allowed, err := verificationSendLimiter.Allow(tx, oncall.SMSPhoneNumber(method.Config))
+	if err != nil {
+		return err
+	}
+	if !allowed {
 		return errVerificationSendLimited
 	}
 	code, err := newVerificationCode()

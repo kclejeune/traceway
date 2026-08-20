@@ -1,63 +1,132 @@
 package middleware
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"math"
 	"net/http"
 	"strconv"
-	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/tracewayapp/lit/v2"
+	"github.com/tracewayapp/traceway/backend/app/db"
+	traceway "go.tracewayapp.com"
 )
 
-// FixedWindowLimiter is a fixed-window in-memory rate limiter keyed by an
-// arbitrary string (IP, user id, phone number, ...). Stale buckets are swept
-// on each call, so the map stays bounded by the number of distinct keys seen
-// within one window.
-type FixedWindowLimiter struct {
-	mu          sync.Mutex
+// RateLimitScope gives unrelated routes an explicit shared budget.
+type RateLimitScope string
+
+const OAuthTokenRateLimitScope RateLimitScope = "oauth-token"
+
+const VerificationSendRateLimitScope RateLimitScope = "verification-send"
+
+const pruneRateLimitBucketsEvery = 256
+
+var rateLimitRequests atomic.Uint64
+
+type databaseLimiter struct {
 	maxRequests int
 	window      time.Duration
-	buckets     map[string]*limiterBucket
+	scope       RateLimitScope
 }
 
-type limiterBucket struct {
-	windowStart time.Time
-	count       int
+// SharedFixedWindowLimiter applies a fixed-window budget through a caller-provided transaction.
+type SharedFixedWindowLimiter struct {
+	limiter *databaseLimiter
 }
 
-func NewFixedWindowLimiter(maxRequests int, window time.Duration) *FixedWindowLimiter {
-	return &FixedWindowLimiter{
-		maxRequests: maxRequests,
-		window:      window,
-		buckets:     map[string]*limiterBucket{},
+func NewSharedFixedWindowLimiter(scope RateLimitScope, maxRequests int, window time.Duration) *SharedFixedWindowLimiter {
+	return &SharedFixedWindowLimiter{limiter: newDatabaseLimiter(scope, maxRequests, window)}
+}
+
+func (l *SharedFixedWindowLimiter) Allow(executor lit.Executor, key string) (bool, error) {
+	allowed, _, err := l.limiter.allow(executor, string(l.limiter.scope), key)
+	return allowed, err
+}
+
+func newDatabaseLimiter(scope RateLimitScope, maxRequests int, window time.Duration) *databaseLimiter {
+	return &databaseLimiter{scope: scope, maxRequests: maxRequests, window: window}
+}
+
+func (l *databaseLimiter) allow(executor lit.Executor, scope, key string) (bool, time.Duration, error) {
+	now := time.Now().UTC()
+	expiresAt := now.Add(l.window).Unix()
+	bucketKey := hashRateLimitKey(scope, key)
+
+	query, args, err := lit.ParseNamedQuery(db.Driver, `
+		INSERT INTO rate_limit_buckets (bucket_key, expires_at, request_count)
+		VALUES (:bucket_key, :expires_at, 1)
+		ON CONFLICT (bucket_key) DO UPDATE SET
+			expires_at = CASE
+				WHEN rate_limit_buckets.expires_at <= :now THEN excluded.expires_at
+				ELSE rate_limit_buckets.expires_at
+			END,
+			request_count = CASE
+				WHEN rate_limit_buckets.expires_at <= :now THEN 1
+				ELSE rate_limit_buckets.request_count + 1
+			END
+		RETURNING request_count, expires_at`, lit.P{
+		"bucket_key": bucketKey,
+		"expires_at": expiresAt,
+		"now":        now.Unix(),
+	})
+	if err != nil {
+		return false, 0, err
+	}
+
+	var count int
+	if err := executor.QueryRow(query, args...).Scan(&count, &expiresAt); err != nil {
+		return false, 0, err
+	}
+	if rateLimitRequests.Add(1)%pruneRateLimitBucketsEvery == 0 {
+		pruneExpiredRateLimitBuckets(executor, now.Unix())
+	}
+
+	retryAfter := time.Until(time.Unix(expiresAt, 0))
+	if retryAfter < 0 {
+		retryAfter = 0
+	}
+	return count <= l.maxRequests, retryAfter, nil
+}
+
+func hashRateLimitKey(scope, key string) string {
+	sum := sha256.Sum256([]byte(scope + "\x00" + key))
+	return hex.EncodeToString(sum[:])
+}
+
+func pruneExpiredRateLimitBuckets(executor lit.Executor, now int64) {
+	query, args, err := lit.ParseNamedQuery(
+		db.Driver,
+		"DELETE FROM rate_limit_buckets WHERE expires_at <= :now",
+		lit.P{"now": now},
+	)
+	if err != nil {
+		traceway.CaptureException(traceway.NewStackTraceErrorf("prepare rate limit bucket cleanup: %w", err))
+		return
+	}
+	if _, err := executor.Exec(query, args...); err != nil {
+		traceway.CaptureException(traceway.NewStackTraceErrorf("prune rate limit buckets: %w", err))
 	}
 }
 
-// Allow consumes one slot for key and reports whether the request is within
-// the limit.
-func (l *FixedWindowLimiter) Allow(key string) bool {
-	now := time.Now()
-
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	for k, b := range l.buckets {
-		if now.Sub(b.windowStart) > l.window {
-			delete(l.buckets, k)
-		}
-	}
-	b, ok := l.buckets[key]
-	if !ok {
-		b = &limiterBucket{windowStart: now}
-		l.buckets[key] = b
-	}
-	b.count++
-	return b.count <= l.maxRequests
-}
-
-func rateLimitWithKey(maxRequests int, window time.Duration, keyOf func(c *gin.Context) string) gin.HandlerFunc {
-	limiter := NewFixedWindowLimiter(maxRequests, window)
+func rateLimitWithKey(scope RateLimitScope, maxRequests int, window time.Duration, keyOf func(c *gin.Context) string) gin.HandlerFunc {
+	limiter := newDatabaseLimiter(scope, maxRequests, window)
 	return func(c *gin.Context) {
-		if !limiter.Allow(keyOf(c)) {
+		requestScope := string(limiter.scope)
+		if requestScope == "" {
+			requestScope = c.Request.Method + " " + c.FullPath()
+		}
+		allowed, retryAfter, err := limiter.allow(db.DB, requestScope, keyOf(c))
+		if err != nil {
+			traceway.CaptureException(traceway.NewStackTraceErrorf("rate limit %s: %w", requestScope, err))
+			c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{"error": "temporarily_unavailable"})
+			return
+		}
+		if !allowed {
+			seconds := max(1, int(math.Ceil(retryAfter.Seconds())))
+			c.Header("Retry-After", strconv.Itoa(seconds))
 			c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{"error": "slow_down"})
 			return
 		}
@@ -65,21 +134,23 @@ func rateLimitWithKey(maxRequests int, window time.Duration, keyOf func(c *gin.C
 	}
 }
 
-// RateLimitPerIP returns a fixed-window per-IP rate limiter for unauthenticated
-// endpoints that persist state per request (e.g. the device-authorize endpoint,
-// which inserts a main-DB row per call).
+// RateLimitPerIP returns a deployment-wide fixed-window limiter for one route.
 func RateLimitPerIP(maxRequests int, window time.Duration) gin.HandlerFunc {
-	return rateLimitWithKey(maxRequests, window, func(c *gin.Context) string {
+	return rateLimitWithKey("", maxRequests, window, func(c *gin.Context) string {
 		return c.ClientIP()
 	})
 }
 
-// RateLimitPerUser keys the limit by the authenticated user (UseAppAuth must
-// run first), so users behind a shared NAT don't exhaust each other's budget
-// and an attacker cannot widen theirs by rotating IPs. Requests without a
-// resolved user fall back to the client IP so the limit still holds.
+// RateLimitPerIPForScope shares one deployment-wide budget across multiple routes.
+func RateLimitPerIPForScope(scope RateLimitScope, maxRequests int, window time.Duration) gin.HandlerFunc {
+	return rateLimitWithKey(scope, maxRequests, window, func(c *gin.Context) string {
+		return c.ClientIP()
+	})
+}
+
+// RateLimitPerUser must run after UseAppAuth. Unresolved users fall back to IP.
 func RateLimitPerUser(maxRequests int, window time.Duration) gin.HandlerFunc {
-	return rateLimitWithKey(maxRequests, window, func(c *gin.Context) string {
+	return rateLimitWithKey("", maxRequests, window, func(c *gin.Context) string {
 		if userId := GetUserId(c); userId != 0 {
 			return "u:" + strconv.Itoa(userId)
 		}

@@ -125,6 +125,54 @@ func (d distributedTraceController) GetDistributedTrace(c *gin.Context) {
 		matchedIds[a.Id] = true
 	}
 
+	var spanTraceIds []uuid.UUID
+	var recordedAtMin, recordedAtMax time.Time
+	addSpanTrace := func(traceId uuid.UUID, recordedAt time.Time) {
+		spanTraceIds = append(spanTraceIds, traceId)
+		if recordedAtMin.IsZero() || recordedAt.Before(recordedAtMin) {
+			recordedAtMin = recordedAt
+		}
+		if recordedAt.After(recordedAtMax) {
+			recordedAtMax = recordedAt
+		}
+	}
+	for _, ep := range endpoints {
+		addSpanTrace(ep.Id, ep.RecordedAt)
+	}
+	for _, t := range tasks {
+		addSpanTrace(t.Id, t.RecordedAt)
+	}
+	for _, a := range aiTraces {
+		addSpanTrace(a.Id, a.RecordedAt)
+	}
+	unmatchedExcTraceIds := make(map[uuid.UUID]bool)
+	for _, exc := range exceptions {
+		if exc.TraceId != nil && !matchedIds[*exc.TraceId] && !unmatchedExcTraceIds[*exc.TraceId] {
+			unmatchedExcTraceIds[*exc.TraceId] = true
+			addSpanTrace(*exc.TraceId, exc.RecordedAt)
+		}
+	}
+
+	spansByTraceId := make(map[uuid.UUID][]models.Span)
+	if len(spanTraceIds) > 0 {
+		span := traceway.StartSpan(c, "loading spans")
+		allSpans, err := telemetry.SpanRepository.FindByTraceIds(c, projectIds, spanTraceIds, recordedAtMin, recordedAtMax)
+		span.End()
+		if err != nil {
+			c.AbortWithError(http.StatusInternalServerError, traceway.NewStackTraceErrorf("failed to query spans: %w", err))
+			return
+		}
+		for _, s := range allSpans {
+			spansByTraceId[s.TraceId] = append(spansByTraceId[s.TraceId], s)
+		}
+	}
+	nodeSpans := func(traceId uuid.UUID) []models.Span {
+		if spans := spansByTraceId[traceId]; spans != nil {
+			return spans
+		}
+		return []models.Span{}
+	}
+
 	var nodes []DistributedTraceNode
 
 	for _, ep := range endpoints {
@@ -133,7 +181,7 @@ func (d distributedTraceController) GetDistributedTrace(c *gin.Context) {
 			ProjectName: projectNameMap[ep.ProjectId],
 			TraceType:   "endpoint",
 			Endpoint:    &ep,
-			Spans:       []models.Span{},
+			Spans:       nodeSpans(ep.Id),
 			Exception:   exceptionByTraceId[ep.Id],
 		}
 		nodes = append(nodes, node)
@@ -145,7 +193,7 @@ func (d distributedTraceController) GetDistributedTrace(c *gin.Context) {
 			ProjectName: projectNameMap[t.ProjectId],
 			TraceType:   "task",
 			Task:        &t,
-			Spans:       []models.Span{},
+			Spans:       nodeSpans(t.Id),
 			Exception:   exceptionByTraceId[t.Id],
 		}
 		nodes = append(nodes, node)
@@ -157,7 +205,7 @@ func (d distributedTraceController) GetDistributedTrace(c *gin.Context) {
 			ProjectName: projectNameMap[a.ProjectId],
 			TraceType:   "ai_trace",
 			AiTrace:     &a,
-			Spans:       []models.Span{},
+			Spans:       nodeSpans(a.Id),
 			Exception:   exceptionByTraceId[a.Id],
 		}
 		nodes = append(nodes, node)
@@ -167,11 +215,15 @@ func (d distributedTraceController) GetDistributedTrace(c *gin.Context) {
 		if exc.TraceId != nil && matchedIds[*exc.TraceId] {
 			continue
 		}
+		spans := []models.Span{}
+		if exc.TraceId != nil {
+			spans = nodeSpans(*exc.TraceId)
+		}
 		nodes = append(nodes, DistributedTraceNode{
 			ProjectId:   exc.ProjectId,
 			ProjectName: projectNameMap[exc.ProjectId],
 			TraceType:   "exception",
-			Spans:       []models.Span{},
+			Spans:       spans,
 			Exception: &EndpointExceptionInfo{
 				ExceptionHash: exc.ExceptionHash,
 				StackTrace:    exc.StackTrace,

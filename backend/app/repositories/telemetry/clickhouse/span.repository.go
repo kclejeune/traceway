@@ -65,9 +65,36 @@ func (r *spanRepository) FindByTraceId(ctx context.Context, projectId, traceId u
 	if err != nil {
 		return nil, err
 	}
+
+	return scanSpans(rows)
+}
+
+func (r *spanRepository) FindByTraceIds(ctx context.Context, projectIds, traceIds []uuid.UUID, recordedAtMin, recordedAtMax time.Time) ([]models.Span, error) {
+	if len(projectIds) == 0 || len(traceIds) == 0 {
+		return []models.Span{}, nil
+	}
+
+	from, _ := shared.TraceWindowBounds(recordedAtMin)
+	_, to := shared.TraceWindowBounds(recordedAtMax)
+	query := `SELECT
+		id, trace_id, project_id, name, start_time, duration, recorded_at, parent_span_id, attributes
+	FROM spans
+	WHERE project_id IN (?) AND trace_id IN (?)
+	AND recorded_at >= ? AND recorded_at <= ?
+	ORDER BY start_time ASC`
+
+	rows, err := chdb.Conn.Query(ctx, query, projectIds, traceIds, from, to)
+	if err != nil {
+		return nil, err
+	}
+
+	return scanSpans(rows)
+}
+
+func scanSpans(rows driver.Rows) ([]models.Span, error) {
 	defer rows.Close()
 
-	var spans []models.Span
+	spans := []models.Span{}
 	for rows.Next() {
 		var s models.Span
 		var attributesJSON string

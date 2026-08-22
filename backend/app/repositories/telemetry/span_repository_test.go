@@ -50,6 +50,51 @@ func TestSpanRepository_InsertAndFindByTraceId(t *testing.T) {
 	}
 }
 
+func TestSpanRepository_FindByTraceIds(t *testing.T) {
+	setupTestDB(t)
+	ctx := context.Background()
+	projectId := uuid.New()
+	otherProjectId := uuid.New()
+	traceA := uuid.New()
+	traceB := uuid.New()
+	now := truncateMs(time.Now().UTC())
+
+	err := SpanRepository.InsertAsync(ctx, []models.Span{
+		makeSpan(projectId, traceA, "a1", now, 100*time.Millisecond),
+		makeSpan(projectId, traceA, "a2", now.Add(10*time.Millisecond), 100*time.Millisecond),
+		makeSpan(projectId, traceB, "b1", now, 100*time.Millisecond),
+		makeSpan(projectId, uuid.New(), "other-trace", now, 100*time.Millisecond),
+		makeSpan(otherProjectId, traceA, "other-project", now, 100*time.Millisecond),
+	})
+	if err != nil {
+		t.Fatalf("InsertAsync failed: %v", err)
+	}
+
+	found, err := SpanRepository.FindByTraceIds(ctx, []uuid.UUID{projectId}, []uuid.UUID{traceA, traceB}, now, now)
+	if err != nil {
+		t.Fatalf("FindByTraceIds failed: %v", err)
+	}
+	if len(found) != 3 {
+		t.Fatalf("expected 3 spans, got %d", len(found))
+	}
+
+	countByTrace := map[uuid.UUID]int{}
+	for _, s := range found {
+		countByTrace[s.TraceId]++
+	}
+	if countByTrace[traceA] != 2 || countByTrace[traceB] != 1 {
+		t.Errorf("expected 2 spans for traceA and 1 for traceB, got %v", countByTrace)
+	}
+
+	empty, err := SpanRepository.FindByTraceIds(ctx, []uuid.UUID{projectId}, nil, now, now)
+	if err != nil {
+		t.Fatalf("FindByTraceIds with no trace ids failed: %v", err)
+	}
+	if len(empty) != 0 {
+		t.Fatalf("expected 0 spans for empty trace id list, got %d", len(empty))
+	}
+}
+
 func TestSpanRepository_AttributesRoundTrip(t *testing.T) {
 	setupTestDB(t)
 	ctx := context.Background()

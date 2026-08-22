@@ -4,9 +4,12 @@ package sqlite
 
 import (
 	"context"
+	"fmt"
+	"strings"
+	"time"
+
 	"github.com/tracewayapp/traceway/backend/app/repositories/telemetry/shared"
 	"github.com/tracewayapp/traceway/backend/app/repositories/telemetry/sqlitetypes"
-	"time"
 
 	"github.com/google/uuid"
 	"github.com/tracewayapp/lit/v2"
@@ -98,6 +101,48 @@ func (r *spanRepository) FindByTraceId(ctx context.Context, projectId, traceId u
 		params["to"] = sqlitetypes.NewSQLiteTime(to)
 	}
 	query += ` ORDER BY start_time ASC`
+
+	rows, err := lit.SelectNamed[span](db.TelemetryDB, query, params)
+	if err != nil {
+		return nil, err
+	}
+
+	spans := make([]models.Span, 0, len(rows))
+	for _, row := range rows {
+		spans = append(spans, row.toModel())
+	}
+	return spans, nil
+}
+
+func (r *spanRepository) FindByTraceIds(ctx context.Context, projectIds, traceIds []uuid.UUID, recordedAtMin, recordedAtMax time.Time) ([]models.Span, error) {
+	if len(projectIds) == 0 || len(traceIds) == 0 {
+		return []models.Span{}, nil
+	}
+
+	params := lit.P{}
+	projectPlaceholders := make([]string, len(projectIds))
+	for i, pid := range projectIds {
+		key := fmt.Sprintf("pid_%d", i)
+		projectPlaceholders[i] = ":" + key
+		params[key] = pid
+	}
+	tracePlaceholders := make([]string, len(traceIds))
+	for i, tid := range traceIds {
+		key := fmt.Sprintf("tid_%d", i)
+		tracePlaceholders[i] = ":" + key
+		params[key] = tid
+	}
+	from, _ := shared.TraceWindowBounds(recordedAtMin)
+	_, to := shared.TraceWindowBounds(recordedAtMax)
+	params["from"] = sqlitetypes.NewSQLiteTime(from)
+	params["to"] = sqlitetypes.NewSQLiteTime(to)
+
+	query := `SELECT id, trace_id, project_id, name, start_time, duration, recorded_at, parent_span_id, attributes
+		FROM spans
+		WHERE project_id IN (` + strings.Join(projectPlaceholders, ",") + `)
+		AND trace_id IN (` + strings.Join(tracePlaceholders, ",") + `)
+		AND recorded_at >= :from AND recorded_at <= :to
+		ORDER BY start_time ASC`
 
 	rows, err := lit.SelectNamed[span](db.TelemetryDB, query, params)
 	if err != nil {

@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -368,6 +370,46 @@ func hasHTTPAttributes(attrs []*commonpb.KeyValue) bool {
 	return false
 }
 
+// FaaS spans can remain open after the response, so reported TTFB better
+// represents client-visible endpoint latency than the total span duration.
+var responseTTFBAttributes = [...]string{
+	"traceway.response_ttfb_ms",
+	"cloudflare.response.time_to_first_byte_ms",
+}
+
+func responseDuration(attrs []*commonpb.KeyValue, spanDuration time.Duration) time.Duration {
+	for _, key := range responseTTFBAttributes {
+		ms, ok := getNumericAttribute(attrs, key)
+		if !ok || ms <= 0 || math.IsNaN(ms) || math.IsInf(ms, 0) {
+			continue
+		}
+		ttfb := time.Duration(ms * float64(time.Millisecond))
+		if ttfb > 0 && ttfb <= spanDuration {
+			return ttfb
+		}
+	}
+	return spanDuration
+}
+
+func getNumericAttribute(attrs []*commonpb.KeyValue, key string) (float64, bool) {
+	for _, kv := range attrs {
+		if kv.Key != key || kv.Value == nil {
+			continue
+		}
+		switch v := kv.Value.Value.(type) {
+		case *commonpb.AnyValue_DoubleValue:
+			return v.DoubleValue, true
+		case *commonpb.AnyValue_IntValue:
+			return float64(v.IntValue), true
+		case *commonpb.AnyValue_StringValue:
+			if f, err := strconv.ParseFloat(v.StringValue, 64); err == nil {
+				return f, true
+			}
+		}
+	}
+	return 0, false
+}
+
 func buildEndpoint(
 	id, projectId uuid.UUID,
 	span *tracepb.Span,
@@ -378,6 +420,7 @@ func buildEndpoint(
 	serverName, appVersion string,
 ) models.Endpoint {
 	endpoint := getHTTPEndpoint(attrs, span.Name)
+	duration = responseDuration(attrs, duration)
 
 	statusCode := int16(0)
 	if code, ok := getIntAttribute(attrs, "http.response.status_code"); ok {

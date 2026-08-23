@@ -1175,3 +1175,55 @@ func TestConvertTraces_FrontendFrameworkSuppressesEntityRows(t *testing.T) {
 		t.Error("expected non-frontend frameworks to keep promoting endpoint rows")
 	}
 }
+
+func TestBuildEndpointTTFBPreference(t *testing.T) {
+	span10s := 10490 * time.Millisecond
+	tests := []struct {
+		name  string
+		attrs []*commonpb.KeyValue
+		want  time.Duration
+	}{
+		{"workers string ttfb replaces invocation wall time", []*commonpb.KeyValue{
+			strKV("http.request.method", "GET"),
+			strKV("cloudflare.response.time_to_first_byte_ms", "5373"),
+		}, 5373 * time.Millisecond},
+		{"vendor-neutral attribute wins over cloudflare's", []*commonpb.KeyValue{
+			strKV("http.request.method", "GET"),
+			intKV("traceway.response_ttfb_ms", 100),
+			strKV("cloudflare.response.time_to_first_byte_ms", "5373"),
+		}, 100 * time.Millisecond},
+		{"ttfb beyond span duration is malformed, span kept", []*commonpb.KeyValue{
+			strKV("http.request.method", "GET"),
+			strKV("cloudflare.response.time_to_first_byte_ms", "99999"),
+		}, span10s},
+		{"invalid preferred attribute falls back to cloudflare's", []*commonpb.KeyValue{
+			strKV("http.request.method", "GET"),
+			strKV("traceway.response_ttfb_ms", "99999"),
+			strKV("cloudflare.response.time_to_first_byte_ms", "5373"),
+		}, 5373 * time.Millisecond},
+		{"zero ttfb ignored", []*commonpb.KeyValue{
+			strKV("http.request.method", "GET"),
+			strKV("cloudflare.response.time_to_first_byte_ms", "0"),
+		}, span10s},
+		{"unparsable ttfb ignored", []*commonpb.KeyValue{
+			strKV("http.request.method", "GET"),
+			strKV("cloudflare.response.time_to_first_byte_ms", "fast"),
+		}, span10s},
+		{"non-finite ttfb ignored", []*commonpb.KeyValue{
+			strKV("http.request.method", "GET"),
+			strKV("cloudflare.response.time_to_first_byte_ms", "NaN"),
+		}, span10s},
+		{"no ttfb attribute keeps span duration", []*commonpb.KeyValue{
+			strKV("http.request.method", "GET"),
+		}, span10s},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			span := &tracepb.Span{Name: "GET /x"}
+			ep := buildEndpoint(uuid.New(), testProjectId, span, tt.attrs, nil, time.Time{}, span10s, "", "")
+			if ep.Duration != tt.want {
+				t.Errorf("buildEndpoint().Duration = %v, want %v", ep.Duration, tt.want)
+			}
+		})
+	}
+}

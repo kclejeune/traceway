@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -368,6 +369,56 @@ func hasHTTPAttributes(attrs []*commonpb.KeyValue) bool {
 	return false
 }
 
+// FaaS runtimes keep the invocation span open past the response (Workers
+// waitUntil, Lambda extensions — the OTel FaaS conventions cover the whole
+// invocation), so span duration overstates the latency the client saw. When
+// the SDK reports time-to-first-byte, prefer it for the endpoint's latency;
+// the full invocation wall time stays queryable in the stored attributes.
+// `traceway.response_ttfb_ms` is the vendor-neutral escape hatch, mirroring
+// `traceway.is_stream`.
+var responseTtfbAttributes = []string{
+	"traceway.response_ttfb_ms",
+	"cloudflare.response.time_to_first_byte_ms",
+}
+
+func responseDuration(attrs []*commonpb.KeyValue, spanDuration time.Duration) time.Duration {
+	for _, key := range responseTtfbAttributes {
+		ms, ok := getNumericAttribute(attrs, key)
+		if !ok || ms <= 0 {
+			continue
+		}
+		ttfb := time.Duration(ms * float64(time.Millisecond))
+		// A TTFB beyond the span's own duration is malformed; keep the span.
+		if ttfb < spanDuration {
+			return ttfb
+		}
+		return spanDuration
+	}
+	return spanDuration
+}
+
+// getNumericAttribute reads a number regardless of OTLP encoding — SDKs
+// stamp numeric extension attributes as double, int, or (the Workers
+// observability integration) string.
+func getNumericAttribute(attrs []*commonpb.KeyValue, key string) (float64, bool) {
+	for _, kv := range attrs {
+		if kv.Key != key || kv.Value == nil {
+			continue
+		}
+		switch v := kv.Value.Value.(type) {
+		case *commonpb.AnyValue_DoubleValue:
+			return v.DoubleValue, true
+		case *commonpb.AnyValue_IntValue:
+			return float64(v.IntValue), true
+		case *commonpb.AnyValue_StringValue:
+			if f, err := strconv.ParseFloat(v.StringValue, 64); err == nil {
+				return f, true
+			}
+		}
+	}
+	return 0, false
+}
+
 func buildEndpoint(
 	id, projectId uuid.UUID,
 	span *tracepb.Span,
@@ -378,6 +429,7 @@ func buildEndpoint(
 	serverName, appVersion string,
 ) models.Endpoint {
 	endpoint := getHTTPEndpoint(attrs, span.Name)
+	duration = responseDuration(attrs, duration)
 
 	statusCode := int16(0)
 	if code, ok := getIntAttribute(attrs, "http.response.status_code"); ok {
